@@ -1,0 +1,16 @@
+{
+    "name": "codere-monorepo",
+    "private": true,
+    "type": "module",
+    "version": "0.1.0",
+    "workspaces": [
+        "packages/*"
+    ],
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "lint": "echo \"no lint configured\"",
+        "test": "echo \"no tests configured\""
+    }
+}
