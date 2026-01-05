@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "projectRoot": "/Users/jiateng.dai/Desktop/codeRe",
+    "generatedAt": "2026-01-05T08:12:01.640Z"
+  },
+  "nodes": {
+    "/Users/jiateng.dai/Desktop/codeRe/src/a.js": {
+      "id": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+      "type": "code"
+    },
+    "/Users/jiateng.dai/Desktop/codeRe/src/index.js": {
+      "id": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+      "type": "code"
+    }
+  },
+  "edges": [
+    {
+      "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+      "to": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+      "kind": "import",
+      "dynamic": false
+    }
+  ],
+  "forward": {
+    "/Users/jiateng.dai/Desktop/codeRe/src/index.js": [
+      {
+        "to": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+        "kind": "import",
+        "dynamic": false
+      }
+    ]
+  },
+  "reverse": {
+    "/Users/jiateng.dai/Desktop/codeRe/src/a.js": [
+      {
+        "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+        "kind": "import",
+        "dynamic": false
+      }
+    ]
+  },
+  "errors": []
+}
