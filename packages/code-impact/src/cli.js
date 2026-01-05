@@ -97,6 +97,15 @@ program
         }
     });
 
+function filterTargets(list = []) {
+    return list.filter((p) => {
+        const norm = p.replace(/\\/g, '/');
+        if (norm.includes('/.code-impact/')) return false;
+        if (norm.endsWith('/impact.mmd') || norm.endsWith('\\impact.mmd') || norm.endsWith('impact.mmd')) return false;
+        return true;
+    });
+}
+
 program
     .command('impact')
     .description('基于依赖图进行影响分析')
@@ -126,6 +135,12 @@ program
         } else {
             console.error(chalk.red('请提供 --files 或 --git-diff'));
             process.exitCode = 1;
+            return;
+        }
+
+        targets = filterTargets(targets);
+        if (targets.length === 0) {
+            console.error(chalk.yellow('过滤后无有效变更文件（已忽略 .code-impact 与 impact.mmd）'));
             return;
         }
 
