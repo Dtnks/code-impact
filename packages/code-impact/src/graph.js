@@ -11,7 +11,7 @@ const CODE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
 const STYLE_EXTS = ['.css', '.scss', '.less'];
 const ASSET_EXTS = ['.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.mp4', '.json'];
 const DEFAULT_EXTS = [...CODE_EXTS, ...STYLE_EXTS, ...ASSET_EXTS];
-const IGNORE_GLOBS = ['**/node_modules/**', '**/dist/**', '**/.git/**', '**/.next/**', '**/.cache/**', '**/coverage/**', '**/build/**'];
+const IGNORE_GLOBS = ['**/node_modules/**', '**/dist/**', '**/.git/**', '**/.next/**', '**/.cache/**', '**/coverage/**', '**/build/**', '**/.code-impact/**', '**/.impact.mmd'];
 
 const NodeType = {
     CODE: 'code',
