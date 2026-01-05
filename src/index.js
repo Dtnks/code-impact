@@ -1,4 +1,4 @@
 import a from './a.js';
-let b = 2;
+import b from './b.js';
 let c = a + b;
 console.log(c);

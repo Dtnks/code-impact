@@ -1,11 +1,15 @@
 {
   "meta": {
     "projectRoot": "/Users/jiateng.dai/Desktop/codeRe",
-    "generatedAt": "2026-01-05T08:18:11.703Z"
+    "generatedAt": "2026-01-05T08:19:45.596Z"
   },
   "nodes": {
     "/Users/jiateng.dai/Desktop/codeRe/src/a.js": {
       "id": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+      "type": "code"
+    },
+    "/Users/jiateng.dai/Desktop/codeRe/src/b.js": {
+      "id": "/Users/jiateng.dai/Desktop/codeRe/src/b.js",
       "type": "code"
     },
     "/Users/jiateng.dai/Desktop/codeRe/src/index.js": {
