@@ -14,7 +14,7 @@ function parseList(val) {
     return val.split(',').map((v) => v.trim()).filter(Boolean);
 }
 
-function toMermaid({ seeds, results, edges }) {
+function toMermaid({ seeds, results, edges, direction = 'forward' }) {
     const ids = new Set();
     [...(seeds || []), ...(results || []).map((r) => r.id)].forEach((id) => {
         if (id) ids.add(id);
@@ -36,8 +36,10 @@ function toMermaid({ seeds, results, edges }) {
     });
     (edges || []).forEach((e) => {
         if (!e?.from || !e?.to) return;
-        const from = idMap.get(e.from);
-        const to = idMap.get(e.to);
+        const forwardFrom = direction === 'reverse' ? e.to : e.from;
+        const forwardTo = direction === 'reverse' ? e.from : e.to;
+        const from = idMap.get(forwardFrom);
+        const to = idMap.get(forwardTo);
         if (!from || !to) return;
         const dyn = e.dynamic ? '|dynamic|' : '';
         lines.push(`  ${from} -->${dyn} ${to}`);
@@ -51,13 +53,13 @@ function toMermaid({ seeds, results, edges }) {
     return lines.join('\n');
 }
 
-function printImpact({ seeds, results, edges }, format = 'table') {
+function printImpact({ seeds, results, edges }, format = 'table', { direction = 'forward' } = {}) {
     if (format === 'json') {
         console.log(JSON.stringify({ seeds, results, edges }, null, 2));
         return;
     }
     if (format === 'mermaid') {
-        console.log(toMermaid({ seeds, results, edges }));
+        console.log(toMermaid({ seeds, results, edges, direction }));
         return;
     }
     const table = new Table({
@@ -113,6 +115,7 @@ program
     .option('--git-diff [range]', '使用 git diff 范围（默认 HEAD~1..HEAD）', 'HEAD~1..HEAD')
     .option('--depth <n>', '向上追踪深度', (v) => Number(v), Infinity)
     .option('--format <fmt>', '输出格式 table|json|mermaid', 'table')
+    .option('--edge-direction <dir>', 'mermaid 边方向 forward|reverse（默认 forward）', 'forward')
     .option('--include-dynamic', '包含动态 import 影响', false)
     .action(async (opts) => {
         const projectRoot = process.cwd();
@@ -146,11 +149,11 @@ program
 
         try {
             const graph = await loadGraph(projectRoot);
-            const { results, edges } = traverseImpact(graph, targets, {
+            const { results, edges, seeds: normalizedSeeds } = traverseImpact(graph, targets, {
                 includeDynamic: !!opts.includeDynamic,
                 depth: Number.isFinite(opts.depth) ? opts.depth : Infinity,
             });
-            printImpact({ seeds: targets, results, edges }, opts.format);
+            printImpact({ seeds: normalizedSeeds, results, edges }, opts.format, { direction: opts.edgeDirection });
         } catch (err) {
             console.error(chalk.red(`分析失败: ${err.message}`));
             process.exitCode = 1;

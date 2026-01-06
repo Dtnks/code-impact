@@ -1,15 +1,31 @@
 import path from 'path';
 import { loadGraph, detectNodeType } from './graph.js';
 
-function normalizeSet(items = []) {
-    return new Set(items.map((p) => path.resolve(p)));
+function normalizeId(p, projectRoot) {
+    if (typeof p !== 'string') return p;
+    if (p.startsWith('pkg:')) return p;
+    const abs = path.resolve(p);
+    if (projectRoot) {
+        const root = path.resolve(projectRoot);
+        if (abs.startsWith(root)) {
+            const rel = path.relative(root, abs);
+            return rel || '.';
+        }
+    }
+    return abs;
+}
+
+function normalizeSet(items = [], projectRoot) {
+    return new Set(items.map((p) => normalizeId(p, projectRoot)));
 }
 
 export function traverseImpact(graph, startFiles, { includeDynamic = true, depth = Infinity } = {}) {
-    const seeds = normalizeSet(startFiles);
+    const projectRoot = graph.meta?.projectRoot;
+    const seeds = normalizeSet(startFiles, projectRoot);
     const visited = new Map();
     const queue = [];
     const edgeMap = new Map(); // key: from=>to
+    const seedList = Array.from(seeds);
 
     // 确保有反向邻接：老版本 graph 可能没有 reverse，按 edges 构建一次
     let reverse = graph.reverse;
@@ -53,7 +69,7 @@ export function traverseImpact(graph, startFiles, { includeDynamic = true, depth
         results.push({ id, distance: dist, type: detectNodeType(id) });
     }
     results.sort((a, b) => a.distance - b.distance || a.id.localeCompare(b.id));
-    return { results, edges: Array.from(edgeMap.values()) };
+    return { results, edges: Array.from(edgeMap.values()), seeds: seedList };
 }
 
 export async function impactFromGraph({

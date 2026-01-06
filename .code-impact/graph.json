@@ -1,63 +1,65 @@
 {
   "meta": {
     "projectRoot": "/Users/jiateng.dai/Desktop/codeRe",
-    "generatedAt": "2026-01-05T08:20:37.154Z"
+    "generatedAt": "2026-01-06T07:58:30.393Z"
   },
   "nodes": {
-    "/Users/jiateng.dai/Desktop/codeRe/src/a.js": {
-      "id": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+    "src/a.js": {
+      "id": "src/a.js",
       "type": "code"
     },
-    "/Users/jiateng.dai/Desktop/codeRe/src/b.js": {
-      "id": "/Users/jiateng.dai/Desktop/codeRe/src/b.js",
+    "src/b.js": {
+      "id": "src/b.js",
       "type": "code"
     },
-    "/Users/jiateng.dai/Desktop/codeRe/src/index.js": {
-      "id": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+    "src/index.js": {
+      "id": "src/index.js",
       "type": "code"
     }
   },
   "edges": [
     {
-      "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
-      "to": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+      "from": "src/index.js",
+      "to": "src/a.js",
       "kind": "import",
       "dynamic": false
     },
     {
-      "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
-      "to": "/Users/jiateng.dai/Desktop/codeRe/src/b.js",
+      "from": "src/index.js",
+      "to": "src/b.js",
       "kind": "import",
       "dynamic": false
     }
   ],
   "forward": {
-    "/Users/jiateng.dai/Desktop/codeRe/src/index.js": [
+    "src/index.js": [
       {
-        "to": "/Users/jiateng.dai/Desktop/codeRe/src/a.js",
+        "to": "src/a.js",
         "kind": "import",
         "dynamic": false
       },
       {
-        "to": "/Users/jiateng.dai/Desktop/codeRe/src/b.js",
+        "to": "src/b.js",
         "kind": "import",
         "dynamic": false
       }
     ]
   },
   "reverse": {
-    "/Users/jiateng.dai/Desktop/codeRe/src/a.js": [
+    "src/a.js": [
       {
-        "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+        "from": "src/index.js",
         "kind": "import",
-        "dynamic": false
+        "dynamic": false,
+        "to": "src/a.js"
       }
     ],
-    "/Users/jiateng.dai/Desktop/codeRe/src/b.js": [
+    "src/b.js": [
       {
-        "from": "/Users/jiateng.dai/Desktop/codeRe/src/index.js",
+        "from": "src/index.js",
         "kind": "import",
-        "dynamic": false
+        "dynamic": false,
+        "to": "src/b.js"
       }
     ]
   },

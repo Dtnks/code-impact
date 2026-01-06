@@ -10,7 +10,7 @@
         "node": ">=20"
     },
     "scripts": {
-        "lint": "echo \"no lint configured\"",
-        "test": "echo \"no tests configured\""
+        "generate-impact": "npx code-impact build-graph --root",
+        "analyze-impact": "npx code-impact impact --git-diff origin/main...HEAD --format mermaid --depth 4 > impact.mmd"
     }
 }

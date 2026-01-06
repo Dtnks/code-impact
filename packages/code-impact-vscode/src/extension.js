@@ -1,7 +1,12 @@
 const vscode = require('vscode');
 const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
 
 const output = vscode.window.createOutputChannel('Code Impact');
+const MAX_BG_FILE_BYTES = 512 * 1024; // 512KB
+let lastImpactCache = null; // { mmd, seeds, results, edges, direction, depth, includeDynamic, settings }
+let bgFilesCache = []; // { path, size, content, truncated }
 
 async function loadCore() {
     try {
@@ -92,9 +97,34 @@ async function showMermaid(content, title = 'impact.mmd') {
     await showMermaidPreview(content, title);
 }
 
+async function readBgFiles(paths = []) {
+    const files = [];
+    for (const p of paths) {
+        try {
+            const stat = await fsp.stat(p);
+            if (!stat.isFile()) continue;
+            const size = stat.size;
+            let truncated = false;
+            let content = '';
+            if (size > MAX_BG_FILE_BYTES) {
+                const buf = await fsp.readFile(p, { encoding: 'utf8' });
+                content = buf.slice(0, MAX_BG_FILE_BYTES);
+                truncated = true;
+            } else {
+                content = await fsp.readFile(p, 'utf8');
+            }
+            files.push({ path: p, size, content, truncated });
+        } catch (err) {
+            output.appendLine(`readBgFiles skip ${p}: ${err?.message || err}`);
+        }
+    }
+    bgFilesCache = files;
+    return files;
+}
+
 function toMermaidWebviewHtml(webview, mmd, title = 'Impact Preview') {
     const nonce = getNonce();
-    const escaped = mmd.replace(/`/g, '\\`').replace(/\$/g, '\\$');
+    const mmdJson = JSON.stringify(mmd || '');
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -110,7 +140,7 @@ function toMermaidWebviewHtml(webview, mmd, title = 'Impact Preview') {
   <div id="app">加载中...</div>
   <script nonce="${nonce}" type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-    const mmd = \`${escaped}\`;
+    const mmd = ${mmdJson};
     mermaid.initialize({ startOnLoad: false, theme: 'dark' });
     const el = document.getElementById('app');
     mermaid.render('impact-graph', mmd).then(({ svg }) => {
@@ -147,7 +177,7 @@ function getNonce() {
     return text;
 }
 
-async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, mermaid = true, root, direction = 'reverse' }) {
+async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, mermaid = true, root, direction = 'reverse', settings = {} }) {
     const { loadGraph, traverseImpact, getChangedFiles } = await loadCore();
     const workspaceRoot = root || await ensureWorkspaceFolder();
     let targets = [];
@@ -164,12 +194,29 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
 
     const graph = await loadGraph(workspaceRoot);
     const { results, edges, seeds } = traverseImpact(graph, targets, {
-        includeDynamic,
+        includeDynamic: true,
         depth: Number.isFinite(depth) ? depth : Infinity,
     });
 
+    const mmd = toMermaid({ seeds, results, edges, direction });
+    lastImpactCache = {
+        mmd,
+        seeds,
+        results,
+        edges,
+        direction,
+        depth,
+        includeDynamic: true,
+        root: workspaceRoot,
+        settings: {
+            includeMmd: true,
+            includeCode: true,
+            includeDynamic: true,
+            codeMaxFiles: settings.codeMaxFiles || 5,
+            codeMaxLines: settings.codeMaxLines || 200,
+        }
+    };
     if (mermaid) {
-        const mmd = toMermaid({ seeds, results, edges, direction });
         await showMermaid(mmd);
     } else {
         const lines = results.map((r) => `${r.distance}\t${r.type}\t${r.id}`);
@@ -177,12 +224,13 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
     }
 }
 
-async function handleAI(prd, allowCode) {
-    if (!allowCode) {
-        vscode.window.showInformationMessage('已取消 AI 分析（接口占位，未调用）。');
-        return;
+async function handleAI(payload) {
+    // 仅占位：将 payload 写入输出，便于后续对接实际 AI 接口
+    try {
+        output.appendLine(`AI payload summary: prdLen=${payload?.prd?.length || 0}, mmd=${payload?.includeMmd}, code=${payload?.includeCode}, bgFiles=${bgFilesCache.length}`);
+    } catch (err) {
+        output.appendLine(`handleAI error: ${err?.stack || err}`);
     }
-    vscode.window.showInformationMessage(`AI 接口占位：PRD 长度 ${prd?.length || 0}。后续可接入具体模型调用。`);
 }
 
 function activate(context) {
@@ -238,14 +286,20 @@ class CodeImpactSidebarProvider {
                         }
                         case 'impactGitDiff': {
                             const root = this.currentRoot || await ensureWorkspaceFolder();
-                            const { range, depth, direction, includeDynamic } = msg.payload || {};
+                            const { range, depth, direction } = msg.payload || {};
                             await runImpact({
                                 gitRange: range || 'origin/main...HEAD',
                                 depth: depth ? Number(depth) : 4,
-                                includeDynamic: !!includeDynamic,
+                                includeDynamic: true,
                                 direction: direction || 'reverse',
                                 root,
                                 mermaid: true,
+                                settings: {
+                                    includeMmd: true,
+                                    includeCode: true,
+                                    codeMaxFiles: 5,
+                                    codeMaxLines: 200,
+                                }
                             });
                             break;
                         }
@@ -262,20 +316,57 @@ class CodeImpactSidebarProvider {
                                 vscode.window.showWarningMessage('未选择文件。');
                                 break;
                             }
-                            const { depth, direction, includeDynamic } = msg.payload || {};
+                            const { depth, direction } = msg.payload || {};
                             await runImpact({
                                 files,
                                 depth: depth ? Number(depth) : 4,
-                                includeDynamic: !!includeDynamic,
+                                includeDynamic: true,
                                 direction: direction || 'reverse',
                                 root,
                                 mermaid: true,
+                                settings: {
+                                    includeMmd: true,
+                                    includeCode: true,
+                                    codeMaxFiles: 5,
+                                    codeMaxLines: 200,
+                                }
                             });
                             break;
                         }
+                        case 'pickBgFiles': {
+                            const picked = await vscode.window.showOpenDialog({
+                                canSelectMany: true,
+                                canSelectFiles: true,
+                                canSelectFolders: false,
+                                openLabel: '选择背景文件（小于 512KB）',
+                            });
+                            if (picked && picked.length) {
+                                await readBgFiles(picked.map((u) => u.fsPath));
+                                webviewView.webview.postMessage({
+                                    type: 'bgFilesUpdated',
+                                    files: bgFilesCache.map(f => ({ path: f.path, size: f.size, truncated: f.truncated })),
+                                });
+                            }
+                            break;
+                        }
+                        case 'clearBgFiles': {
+                            bgFilesCache = [];
+                            webviewView.webview.postMessage({ type: 'bgFilesUpdated', files: [] });
+                            break;
+                        }
                         case 'ai': {
-                            const { prd, allowCode } = msg.payload || {};
-                            await handleAI(prd, !!allowCode);
+                            const { prd } = msg.payload || {};
+                            const payload = {
+                                prd,
+                                allowCode: true,
+                                includeMmd: true,
+                                includeCode: true,
+                                codeMaxFiles: 5,
+                                codeMaxLines: 200,
+                                impact: lastImpactCache,
+                                bgFiles: bgFilesCache,
+                            };
+                            await handleAI(payload);
                             break;
                         }
                         default:
@@ -322,26 +413,37 @@ class CodeImpactSidebarProvider {
   <div style="margin-top:8px;">
     <div><b>Git Diff 影响分析</b></div>
     <input id="gitRange" type="text" value="origin/main...HEAD" />
-    <div style="display:flex;flex-d">
-        <label>深度 <input id="depthGit" type="number" value="4" style="width:60px;" /></label>
-        <select id="dirGit">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label>深度 <input id="depthGit" type="number" value="4" style="width:60px;" /></label>
+      <select id="dirGit">
         <option value="reverse" selected>反向箭头</option>
         <option value="forward">正向箭头</option>
-        </select>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label>最多文件 <input id="codeMaxFiles" type="number" value="5" style="width:50px;" /></label>
+      <label>每文件行数 <input id="codeMaxLines" type="number" value="200" style="width:60px;" /></label>
     </div>
     <button id="git">运行 Git Diff 分析</button>
   </div>
 
   <div style="margin-top:8px;">
     <div><b>文件种子影响分析</b></div>
-    <div style="display:flex;flex-direction:row">
-        <label>深度 <input id="depthFiles" type="number" value="4" style="width:60px;" /></label>
-        <select id="dirFiles">
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label>深度 <input id="depthFiles" type="number" value="4" style="width:60px;" /></label>
+      <select id="dirFiles">
         <option value="reverse" selected>反向箭头</option>
         <option value="forward">正向箭头</option>
-        </select>
+      </select>
     </div>
     <button id="files">选择文件并分析</button>
+  </div>
+
+  <div style="margin-top:8px;">
+    <div><b>背景文件</b></div>
+    <button id="pickBg">选择背景文件</button>
+    <button id="clearBg">清空背景文件</button>
+    <div id="bgList" style="font-size:12px;color:#aaa;margin-top:4px;">无</div>
   </div>
 
   <div style="margin-top:8px;">
@@ -354,6 +456,24 @@ class CodeImpactSidebarProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const rootLabel = document.getElementById('rootLabel');
+    const bgList = document.getElementById('bgList');
+    const state = { bgFiles: [] };
+    const commonPayload = () => ({
+      codeMaxFiles: Number(document.getElementById('codeMaxFiles').value || 5),
+      codeMaxLines: Number(document.getElementById('codeMaxLines').value || 200),
+      includeMmd: true,
+      includeCode: true,
+      includeDynamic: true,
+    });
+
+    const renderBg = () => {
+      if (!state.bgFiles.length) { bgList.textContent = '无'; return; }
+      bgList.innerHTML = state.bgFiles.map(f => {
+        const sizeKb = Math.round(f.size / 1024);
+        return f.path + ' (' + sizeKb + 'KB' + (f.truncated ? ',截断' : '') + ')';
+      }).join('<br/>');
+    };
+
     document.getElementById('pickRoot').onclick = () => vscode.postMessage({ type: 'selectRoot' });
     document.getElementById('build').onclick = () => vscode.postMessage({ type: 'buildGraph' });
     document.getElementById('git').onclick = () => {
@@ -363,6 +483,7 @@ class CodeImpactSidebarProvider {
           range: document.getElementById('gitRange').value,
           depth: document.getElementById('depthGit').value,
           direction: document.getElementById('dirGit').value,
+          ...commonPayload(),
         }
       });
     };
@@ -372,14 +493,19 @@ class CodeImpactSidebarProvider {
         payload: {
           depth: document.getElementById('depthFiles').value,
           direction: document.getElementById('dirFiles').value,
+          ...commonPayload(),
         }
       });
     };
+    document.getElementById('pickBg').onclick = () => vscode.postMessage({ type: 'pickBgFiles' });
+    document.getElementById('clearBg').onclick = () => vscode.postMessage({ type: 'clearBgFiles' });
     document.getElementById('ai').onclick = () => {
       vscode.postMessage({
         type: 'ai',
         payload: {
           prd: document.getElementById('prd').value,
+          allowCode: true,
+          ...commonPayload(),
         }
       });
     };
@@ -388,7 +514,12 @@ class CodeImpactSidebarProvider {
       if (msg.type === 'rootSelected') {
         rootLabel.textContent = msg.root;
       }
+      if (msg.type === 'bgFilesUpdated') {
+        state.bgFiles = msg.files || [];
+        renderBg();
+      }
     });
+    renderBg();
   </script>
 </body>
 </html>`;

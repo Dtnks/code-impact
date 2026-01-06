@@ -262,7 +262,65 @@ export async function buildGraph({
         }
     }
 
-    return graph;
+    return relativizeGraph(graph);
+}
+
+function relativizeId(id, projectRoot) {
+    if (id.startsWith('pkg:')) return id;
+    const absRoot = normalize(projectRoot);
+    const abs = normalize(id);
+    if (abs.startsWith(absRoot)) {
+        const rel = path.relative(absRoot, abs);
+        return rel || '.';
+    }
+    return id;
+}
+
+function relativizeGraph(graph) {
+    const projectRoot = graph.meta?.projectRoot || process.cwd();
+    const map = new Map();
+    Object.keys(graph.nodes).forEach((id) => {
+        map.set(id, relativizeId(id, projectRoot));
+    });
+    const remapNode = (id) => map.get(id) || id;
+
+    const nodes = {};
+    Object.values(graph.nodes).forEach((n) => {
+        const newId = remapNode(n.id);
+        nodes[newId] = { ...n, id: newId };
+    });
+
+    const edges = (graph.edges || []).map((e) => ({
+        ...e,
+        from: remapNode(e.from),
+        to: remapNode(e.to),
+    }));
+
+    const forward = {};
+    Object.entries(graph.forward || {}).forEach(([from, list]) => {
+        const nf = remapNode(from);
+        forward[nf] = (list || []).map((e) => ({
+            ...e,
+            to: remapNode(e.to),
+        }));
+    });
+
+    const reverse = {};
+    Object.entries(graph.reverse || {}).forEach(([to, list]) => {
+        const nt = remapNode(to);
+        reverse[nt] = (list || []).map((e) => ({
+            ...e,
+            from: remapNode(e.from),
+            to: remapNode(e.to || to),
+        }));
+    });
+
+    const errors = (graph.errors || []).map((er) => ({
+        ...er,
+        file: er.file ? relativizeId(er.file, projectRoot) : er.file,
+    }));
+
+    return { ...graph, nodes, edges, forward, reverse, errors };
 }
 
 export async function saveGraph(graph, projectRoot = process.cwd()) {

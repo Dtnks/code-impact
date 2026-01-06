@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Code Impact Extension",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--extensionDevelopmentPath=${workspaceFolder}/packages/code-impact-vscode"
+            ],
+            "outFiles": [
+                "${workspaceFolder}/packages/code-impact-vscode/src/**/*.js",
+                "${workspaceFolder}/packages/code-impact-vscode/dist/**/*.js"
+            ],
+            "skipFiles": [
+                "<node_internals>/**"
+            ]
+        }
+    ]
+}
