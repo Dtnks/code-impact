@@ -1,0 +1,41 @@
+{
+    "name": "code-impact-vscode",
+    "displayName": "Code Impact",
+    "description": "依赖图与变更影响分析，基于 code-impact CLI。API 接口预留，可附带代码片段。",
+    "version": "0.1.0",
+    "publisher": "local",
+    "engines": {
+        "vscode": "^1.80.0"
+    },
+    "main": "./src/extension.js",
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [
+        "onStartupFinished",
+        "onView:codeImpact.sidebar"
+    ],
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "codeImpact",
+                    "title": "Code Impact",
+                    "icon": "media/icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "codeImpact": [
+                {
+                    "id": "codeImpact.sidebar",
+                    "name": "Code Impact",
+                    "type": "webview"
+                }
+            ]
+        }
+    },
+    "dependencies": {
+        "code-impact": "file:../code-impact"
+    }
+}
