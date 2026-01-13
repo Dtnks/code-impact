@@ -28,7 +28,8 @@ function filterTargets(list = []) {
     return list.filter((p) => {
         const norm = p.replace(/\\/g, '/');
         if (norm.includes('/.code-impact/')) return false;
-        if (norm.endsWith('impact.mmd')) return false;
+        if (norm.endsWith('impact.txt')) return false;
+        if (norm.endsWith('impactCode.txt')) return false;
         return true;
     });
 }
@@ -48,7 +49,19 @@ async function ensureWorkspaceFolder() {
 
 async function runBuildGraph(root) {
     const { buildGraph, saveGraph } = await loadCore();
-    const graph = await buildGraph({ projectRoot: root, roots: ['src'] });
+    // 优先使用选定目录下的 src，若不存在则使用选定目录本身
+    let roots = [];
+    const candidate = path.join(root, 'src');
+    try {
+        const stat = await fsp.stat(candidate);
+        if (stat.isDirectory()) roots.push('src');
+    } catch {
+        // ignore
+    }
+    if (roots.length === 0) {
+        roots = ['.'];
+    }
+    const graph = await buildGraph({ projectRoot: root, roots });
     const out = await saveGraph(graph, root);
     vscode.window.showInformationMessage(`依赖图已生成: ${out}`);
 }
@@ -95,6 +108,82 @@ async function showMermaid(content, title = 'impact.mmd') {
     await vscode.window.showTextDocument(doc, { preview: true });
     showInfo(`${title} 已生成（可用 Mermaid 预览插件查看）`);
     await showMermaidPreview(content, title);
+}
+
+async function collectCodeSnippets(root, files, { maxFiles = 5, maxLines = 200, rangesMap = {} } = {}) {
+    const normKey = (p) => {
+        if (!p) return p;
+        let k = p.replace(/^a\//, '').replace(/^b\//, '').replace(/^\.?\//, '');
+        if (k.startsWith('../')) k = k.replace(/^\.\.\//, '');
+        return k;
+    };
+    const snippets = [];
+    const picked = Array.from(new Set(files)).slice(0, maxFiles);
+    for (const f of picked) {
+        if (!f || f.startsWith('pkg:')) continue;
+        const abs = path.isAbsolute(f) ? f : path.join(root, f);
+        try {
+            const buf = await fsp.readFile(abs, 'utf8');
+            const lines = buf.split(/\r?\n/);
+            const key = normKey(f);
+            const relKey = normKey(path.relative(root, abs));
+            const ranges = rangesMap[key] || rangesMap[relKey] || [];
+            if (ranges.length) {
+                const contents = [];
+                const changeLines = [];
+                for (const r of ranges) {
+                    const start = Math.max(1, r.start);
+                    const end = Math.min(lines.length, r.end);
+                    if (end < start) continue;
+                    contents.push(lines.slice(start - 1, end).join('\n'));
+                    changeLines.push({ start, end });
+                }
+                snippets.push({
+                    path: f,
+                    lines: lines.length,
+                    truncated: false,
+                    changeLines,
+                    contents,
+                });
+            } else {
+                const truncated = lines.length > maxLines;
+                const content = lines.slice(0, maxLines).join('\n');
+                snippets.push({ path: f, lines: lines.length, truncated, contents: [content], changeLines: [] });
+            }
+        } catch (err) {
+            output.appendLine(`读取代码片段失败 ${f}: ${err?.message || err}`);
+        }
+    }
+    return snippets;
+}
+
+async function saveImpactOutputs(root, { mmd, seeds, results, edges, codeSnippets }) {
+    try {
+        const mmdUri = vscode.Uri.file(path.join(root, 'impact.txt'));
+        const jsonUri = vscode.Uri.file(path.join(root, 'impactCode.txt'));
+        await vscode.workspace.fs.writeFile(mmdUri, Buffer.from(mmd, 'utf8'));
+        await vscode.workspace.fs.writeFile(
+            jsonUri,
+            Buffer.from(
+                JSON.stringify(
+                    {
+                        seeds,
+                        results,
+                        edges,
+                        codeSnippets,
+                        generatedAt: new Date().toISOString(),
+                    },
+                    null,
+                    2
+                ),
+                'utf8'
+            )
+        );
+        output.appendLine(`已自动保存 impact.txt 与 impactCode.txt 至: ${root}`);
+    } catch (err) {
+        output.appendLine(`保存结果文件失败: ${err?.stack || err}`);
+        vscode.window.showWarningMessage(`保存结果文件失败: ${err?.message || err}`);
+    }
 }
 
 async function readBgFiles(paths = []) {
@@ -178,7 +267,7 @@ function getNonce() {
 }
 
 async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, mermaid = true, root, direction = 'reverse', settings = {} }) {
-    const { loadGraph, traverseImpact, getChangedFiles } = await loadCore();
+    const { loadGraph, traverseImpact, getChangedFiles, getChangedRanges } = await loadCore();
     const workspaceRoot = root || await ensureWorkspaceFolder();
     let targets = [];
     if (files && files.length) {
@@ -193,12 +282,28 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
     }
 
     const graph = await loadGraph(workspaceRoot);
+    let rangesMap = {};
+    if (gitRange) {
+        try {
+            rangesMap = getChangedRanges({ projectRoot: workspaceRoot, range: gitRange, files: targets });
+        } catch {
+            rangesMap = {};
+        }
+    }
     const { results, edges, seeds } = traverseImpact(graph, targets, {
-        includeDynamic: true,
+        includeDynamic,
         depth: Number.isFinite(depth) ? depth : Infinity,
     });
 
     const mmd = toMermaid({ seeds, results, edges, direction });
+    const codeFiles = [...(seeds || []), ...(results || []).map((r) => r.id)];
+    const codeSnippets = await collectCodeSnippets(workspaceRoot, codeFiles, {
+        maxFiles: settings.codeMaxFiles || 5,
+        maxLines: settings.codeMaxLines || 200,
+        rangesMap,
+    });
+    await saveImpactOutputs(workspaceRoot, { mmd, seeds, results, edges, codeSnippets });
+
     lastImpactCache = {
         mmd,
         seeds,
@@ -206,14 +311,15 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
         edges,
         direction,
         depth,
-        includeDynamic: true,
+        includeDynamic,
         root: workspaceRoot,
         settings: {
             includeMmd: true,
             includeCode: true,
-            includeDynamic: true,
+            includeDynamic,
             codeMaxFiles: settings.codeMaxFiles || 5,
             codeMaxLines: settings.codeMaxLines || 200,
+            codeSnippetsCount: codeSnippets.length,
         }
     };
     if (mermaid) {
@@ -227,7 +333,7 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
 async function handleAI(payload) {
     // 仅占位：将 payload 写入输出，便于后续对接实际 AI 接口
     try {
-        output.appendLine(`AI payload summary: prdLen=${payload?.prd?.length || 0}, mmd=${payload?.includeMmd}, code=${payload?.includeCode}, bgFiles=${bgFilesCache.length}`);
+        output.appendLine(`AI payload summary: prdLen=${payload?.prd?.length || 0}, mmd=${payload?.includeMmd}, code=${payload?.includeCode}, bgFiles=${bgFilesCache.length}, codeSnippets=${lastImpactCache?.settings?.codeSnippetsCount || 0}`);
     } catch (err) {
         output.appendLine(`handleAI error: ${err?.stack || err}`);
     }

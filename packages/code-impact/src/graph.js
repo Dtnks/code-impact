@@ -7,7 +7,7 @@ import postcss from 'postcss';
 import safeParser from 'postcss-safe-parser';
 import { loadWebpackResolve } from './resolvers/webpack.js';
 
-const CODE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
+const CODE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.vue'];
 const STYLE_EXTS = ['.css', '.scss', '.less'];
 const ASSET_EXTS = ['.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.mp4', '.json'];
 const DEFAULT_EXTS = [...CODE_EXTS, ...STYLE_EXTS, ...ASSET_EXTS];
@@ -160,6 +160,49 @@ async function parseCssDeps(code, fromFile) {
     return results;
 }
 
+function parseAttrs(raw = '') {
+    const attrs = {};
+    const re = /(\w+)(?:\s*=\s*("(.*?)"|'(.*?)'|[^\s"'>]+))?/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+        const key = m[1];
+        const val = m[3] || m[4] || (m[2] ? m[2] : '');
+        if (key) attrs[key] = val;
+    }
+    return attrs;
+}
+
+function parseVueSfc(content) {
+    const scripts = [];
+    const scriptSrc = [];
+    const styles = [];
+    const styleSrc = [];
+
+    const scriptRe = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+    let sm;
+    while ((sm = scriptRe.exec(content)) !== null) {
+        const attrs = parseAttrs(sm[1] || '');
+        if (attrs.src) {
+            scriptSrc.push(attrs.src.trim());
+        }
+        const body = sm[2] || '';
+        if (body.trim()) scripts.push(body);
+    }
+
+    const styleRe = /<style\b([^>]*)>([\s\S]*?)<\/style>/gi;
+    let stm;
+    while ((stm = styleRe.exec(content)) !== null) {
+        const attrs = parseAttrs(stm[1] || '');
+        if (attrs.src) {
+            styleSrc.push(attrs.src.trim());
+        }
+        const body = stm[2] || '';
+        if (body.trim()) styles.push(body);
+    }
+
+    return { scripts, scriptSrc, styles, styleSrc };
+}
+
 export async function buildGraph({
     projectRoot = process.cwd(),
     roots,
@@ -198,7 +241,7 @@ export async function buildGraph({
 
     const files = new Set();
     for (const root of resolvedRoots) {
-        const found = await fg(['**/*.{ts,tsx,js,jsx,mjs,cjs,css,scss,less,svg,png,jpg,jpeg,gif,webp,avif,mp4,json}'], {
+        const found = await fg(['**/*.{ts,tsx,js,jsx,mjs,cjs,vue,css,scss,less,svg,png,jpg,jpeg,gif,webp,avif,mp4,json}'], {
             cwd: root,
             absolute: true,
             ignore: IGNORE_GLOBS,
@@ -232,6 +275,54 @@ export async function buildGraph({
         }
 
         if (type === NodeType.CODE) {
+            const isVue = path.extname(file).toLowerCase() === '.vue';
+            if (isVue) {
+                const { scripts, scriptSrc, styles, styleSrc } = parseVueSfc(content);
+                // external script src
+                scriptSrc.forEach((spec) => {
+                    const target = resolveWithAlias(spec, file, { projectRoot, alias, extensions });
+                    addNode(target);
+                    const kind = detectNodeType(target) === NodeType.PKG ? 'pkg' : 'import';
+                    addEdge(file, target, kind, false);
+                });
+                // inline scripts
+                for (const block of scripts) {
+                    try {
+                        const ast = parse(block, {
+                            jsx: true,
+                            loc: false,
+                            range: false,
+                            sourceType: 'module',
+                            ecmaVersion: 'latest',
+                        });
+                        const deps = collectCodeEdges(ast, file);
+                        for (const dep of deps) {
+                            const target = resolveWithAlias(dep.spec, file, { projectRoot, alias, extensions });
+                            addNode(target);
+                            const kind = detectNodeType(target) === NodeType.PKG ? 'pkg' : dep.kind;
+                            addEdge(file, target, kind, dep.dynamic);
+                        }
+                    } catch (err) {
+                        graph.errors.push({ file, error: `parse vue <script> failed: ${err.message}` });
+                    }
+                }
+                // external styles
+                styleSrc.forEach((spec) => {
+                    const target = resolveWithAlias(spec, file, { projectRoot, alias, extensions });
+                    addNode(target);
+                    addEdge(file, target, 'style', false);
+                });
+                // inline styles
+                for (const block of styles) {
+                    const deps = await parseCssDeps(block, file);
+                    for (const dep of deps) {
+                        const target = resolveWithAlias(dep.spec, file, { projectRoot, alias, extensions });
+                        addNode(target);
+                        addEdge(file, target, dep.kind, dep.dynamic);
+                    }
+                }
+                continue;
+            }
             let ast;
             try {
                 ast = parse(content, {
