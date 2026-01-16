@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import path from 'path';
 
 export function getChangedFiles({ projectRoot = process.cwd(), range = 'HEAD~1..HEAD' }) {
@@ -20,25 +20,30 @@ export function getChangedFiles({ projectRoot = process.cwd(), range = 'HEAD~1..
 
 export function getChangedRanges({ projectRoot = process.cwd(), range = 'HEAD~1..HEAD', files = [] }) {
     const map = {};
+    const debug = {
+        rels: [],
+        firstArgs: null,
+        firstOutLen: 0,
+        firstOutSample: '',
+        allArgs: null,
+        allOutLen: 0,
+        allOutSample: '',
+        fallbackArgs: null,
+        fallbackOutLen: 0,
+        fallbackOutSample: '',
+    };
     const normKey = (p) => {
         if (!p) return p;
         let k = p.replace(/^a\//, '').replace(/^b\//, '').replace(/^\.?\//, '');
+        if (path.isAbsolute(k)) {
+            const rel = path.relative(projectRoot, k);
+            if (rel && !rel.startsWith('..')) k = rel;
+        }
         if (k.startsWith('../')) k = k.replace(/^\.\.\//, '');
+        k = k.split(path.sep).join('/'); // normalize to posix
         return k;
     };
-    try {
-        const rels = files
-            .map((p) => path.relative(projectRoot, p))
-            .filter((p) => p && p !== '.' && !p.startsWith('..'));
-        const args = ['diff', '--no-color', '--unified=0', range];
-        if (rels.length) {
-            args.push('--', ...rels);
-        }
-        const output = execSync(`git ${args.join(' ')}`, {
-            cwd: projectRoot,
-            stdio: ['ignore', 'pipe', 'ignore'],
-            encoding: 'utf8',
-        });
+    const parseDiff = (output) => {
         const lines = output.split('\n');
         let current = null;
         const hunkRe = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
@@ -62,9 +67,59 @@ export function getChangedRanges({ projectRoot = process.cwd(), range = 'HEAD~1.
                 map[key].push({ start, end: start + count - 1 });
             }
         }
+    };
+
+    const runDiff = (args) => {
+        const res = spawnSync('git', args, {
+            cwd: projectRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (res.error) return '';
+        if (res.status === 0 || res.status === 1) {
+            if (!res.stdout && res.stderr) return res.stderr;
+            return res.stdout || '';
+        }
+        if (res.stdout) return res.stdout;
+        if (res.stderr) return res.stderr;
+        return '';
+    };
+
+    try {
+        const rels = files
+            .map((p) => path.relative(projectRoot, p))
+            .filter((p) => p && p !== '.' && !p.startsWith('..'));
+        debug.rels = rels;
+        const args = ['diff', '--no-color', '--unified=0', range];
+        if (rels.length) args.push('--', ...rels);
+        debug.firstArgs = args;
+        let output = runDiff(args);
+        debug.firstOutLen = output.length;
+        debug.firstOutSample = output.slice(0, 500);
+        parseDiff(output);
+        if (Object.keys(map).length === 0) {
+            // fallback: 不限制路径
+            const argsAll = ['diff', '--no-color', '--unified=0', range];
+            debug.allArgs = argsAll;
+            output = runDiff(argsAll);
+            debug.allOutLen = output.length;
+            debug.allOutSample = output.slice(0, 500);
+            parseDiff(output);
+        }
+        if (Object.keys(map).length === 0) {
+            // fallback2: 不带 range，直接对工作区/staged 取 diff
+            const fallbackArgs = ['diff', '--no-color', '--unified=0'];
+            if (rels.length) fallbackArgs.push('--', ...rels);
+            debug.fallbackArgs = fallbackArgs;
+            const outFallback = runDiff(fallbackArgs);
+            debug.fallbackOutLen = outFallback.length;
+            debug.fallbackOutSample = outFallback.slice(0, 500);
+            parseDiff(outFallback);
+        }
     } catch (err) {
-        // ignore, return empty map
+        // ignore, return map (possibly empty)
     }
+    map.__debug = debug;
     return map;
 }
 

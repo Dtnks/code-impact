@@ -417,13 +417,13 @@ function relativizeGraph(graph) {
 export async function saveGraph(graph, projectRoot = process.cwd()) {
     const outDir = path.join(projectRoot, '.code-impact');
     await ensureDir(outDir);
-    const file = path.join(outDir, 'graph.json');
+    const file = path.join(outDir, 'graph.txt');
     await fsp.writeFile(file, JSON.stringify(graph, null, 2), 'utf8');
     return file;
 }
 
 export async function loadGraph(projectRoot = process.cwd()) {
-    const file = path.join(projectRoot, '.code-impact', 'graph.json');
+    const file = path.join(projectRoot, '.code-impact', 'graph.txt');
     const raw = await fsp.readFile(file, 'utf8');
     return JSON.parse(raw);
 }

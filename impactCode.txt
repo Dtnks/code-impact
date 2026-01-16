@@ -1,48 +1,24 @@
 {
   "seeds": [
-    "src/a.js",
-    "src/b.js"
+    "src/index.js"
   ],
-  "results": [
-    {
-      "id": "src/index.js",
-      "distance": 1,
-      "type": "code"
-    }
-  ],
-  "edges": [
-    {
-      "from": "src/index.js",
-      "to": "src/a.js",
-      "kind": "import",
-      "dynamic": false
-    },
-    {
-      "from": "src/index.js",
-      "to": "src/b.js",
-      "kind": "import",
-      "dynamic": false
-    }
-  ],
+  "results": [],
+  "edges": [],
   "codeSnippets": [
     {
-      "path": "src/a.js",
-      "lines": 4,
-      "truncated": false,
-      "content": "export default function a() {\n    return 8;\n}\n"
-    },
-    {
-      "path": "src/b.js",
-      "lines": 3,
-      "truncated": false,
-      "content": "export default function b() {\n    return 1;\n}"
-    },
-    {
       "path": "src/index.js",
-      "lines": 4,
+      "lines": 5,
       "truncated": false,
-      "content": "import a from './a.js';\nimport b from './b.js';\nlet c = a + b;\nconsole.log(c);"
+      "changeLines": [
+        {
+          "start": 4,
+          "end": 4
+        }
+      ],
+      "contents": [
+        "console.log('test')"
+      ]
     }
   ],
-  "generatedAt": "2026-01-06T09:08:09.191Z"
+  "generatedAt": "2026-01-13T02:59:39.525Z"
 }

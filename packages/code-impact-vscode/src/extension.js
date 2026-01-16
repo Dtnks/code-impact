@@ -2,21 +2,35 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
+const { execSync } = require('child_process');
+const { FormData, File } = require('undici');
+
+const { DifyClient } = require('./dify-client');
+function inferMimeByExt(filePath) {
+    const base = path.basename(filePath).toLowerCase();
+    const ext = (path.extname(filePath) || '').toLowerCase();
+    if (base.startsWith('graph') || ext === '.json') return 'application/json';
+    if (ext === '.txt' || ext === '.mmd' || base.includes('impact')) return 'text/plain';
+    return 'application/octet-stream';
+}
 
 const output = vscode.window.createOutputChannel('Code Impact');
-const MAX_BG_FILE_BYTES = 512 * 1024; // 512KB
 let lastImpactCache = null; // { mmd, seeds, results, edges, direction, depth, includeDynamic, settings }
 let bgFilesCache = []; // { path, size, content, truncated }
+let aiStreamPanel = null;
+let sidebarWebview = null;
 
 async function loadCore() {
     try {
-        const core = await import('code-impact');
+        const corePath = path.resolve(__dirname, '../../code-impact/src/index.js');
+        const core = await import(corePath);
         return {
             buildGraph: core.buildGraph,
             saveGraph: core.saveGraph,
             loadGraph: core.loadGraph,
             traverseImpact: core.traverseImpact,
             getChangedFiles: core.getChangedFiles,
+            getChangedRanges: core.getChangedRanges,
         };
     } catch (err) {
         output.appendLine(`loadCore failed: ${err?.stack || err}`);
@@ -45,6 +59,89 @@ async function ensureWorkspaceFolder() {
         throw new Error('no workspace');
     }
     return ws[0].uri.fsPath;
+}
+
+function execGit(command, cwd) {
+    return execSync(`git ${command}`, {
+        cwd,
+        encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
+    }).trim();
+}
+
+function collectGitContext(root, range) {
+    if (!range) return null;
+    try {
+        const diff = execGit(`diff ${range}`, root);
+        const changedRaw = execGit(`diff --name-status ${range}`, root);
+        const statsRaw = execGit(`diff --stat ${range}`, root);
+        const files = { added: [], modified: [], deleted: [], renamed: [] };
+        (changedRaw || '').split('\n').filter(Boolean).forEach((line) => {
+            const [status, ...fileParts] = line.split('\t');
+            const file = fileParts.join('\t');
+            switch (status?.[0]) {
+                case 'A':
+                    files.added.push(file);
+                    break;
+                case 'M':
+                    files.modified.push(file);
+                    break;
+                case 'D':
+                    files.deleted.push(file);
+                    break;
+                case 'R':
+                    files.renamed.push({ from: fileParts[0], to: fileParts[1] });
+                    break;
+                default:
+                    break;
+            }
+        });
+        const summaryLine = (statsRaw || '').split('\n').pop() || '';
+        const filesMatch = summaryLine.match(/(\d+) files? changed/);
+        const insertionsMatch = summaryLine.match(/(\d+) insertions?\(\+\)/);
+        const deletionsMatch = summaryLine.match(/(\d+) deletions?\(-\)/);
+        const stats = {
+            filesChanged: filesMatch ? parseInt(filesMatch[1], 10) : 0,
+            insertions: insertionsMatch ? parseInt(insertionsMatch[1], 10) : 0,
+            deletions: deletionsMatch ? parseInt(deletionsMatch[1], 10) : 0,
+            raw: statsRaw,
+        };
+        return { diff, files, stats, range };
+    } catch (err) {
+        output.appendLine(`collectGitContext error: ${err?.message || err}`);
+        vscode.window.showWarningMessage(`获取 Git diff 失败: ${err?.message || err}`);
+        return null;
+    }
+}
+
+async function fileExists(p) {
+    try {
+        const st = await fsp.stat(p);
+        return st.isFile();
+    } catch {
+        return false;
+    }
+}
+
+async function appendFile(formData, field, filePath, displayName) {
+    if (!filePath || !formData) return false;
+    const exists = await fileExists(filePath);
+    if (!exists) return false;
+    const buf = await fsp.readFile(filePath);
+    const file = new File([buf], displayName || path.basename(filePath), { type: 'application/octet-stream' });
+    formData.append(field, file);
+    return true;
+}
+
+function findGraphPath(root) {
+    const candidates = [
+        path.join(root, '.code-impact', 'graph.txt'),
+        path.join(root, 'graph.txt'),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return null;
 }
 
 async function runBuildGraph(root) {
@@ -114,7 +211,12 @@ async function collectCodeSnippets(root, files, { maxFiles = 5, maxLines = 200, 
     const normKey = (p) => {
         if (!p) return p;
         let k = p.replace(/^a\//, '').replace(/^b\//, '').replace(/^\.?\//, '');
+        if (path.isAbsolute(k)) {
+            const rel = path.relative(root, k);
+            if (rel && !rel.startsWith('..')) k = rel;
+        }
         if (k.startsWith('../')) k = k.replace(/^\.\.\//, '');
+        k = k.split(path.sep).join('/'); // posix normalize
         return k;
     };
     const snippets = [];
@@ -230,7 +332,7 @@ function toMermaidWebviewHtml(webview, mmd, title = 'Impact Preview') {
   <script nonce="${nonce}" type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
     const mmd = ${mmdJson};
-    mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+    mermaid.initialize({ startOnLoad: false, theme: 'white' });
     const el = document.getElementById('app');
     mermaid.render('impact-graph', mmd).then(({ svg }) => {
       el.innerHTML = svg;
@@ -302,6 +404,7 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
         maxLines: settings.codeMaxLines || 200,
         rangesMap,
     });
+    output.appendLine(`rangesMap keys: ${Object.keys(rangesMap).join(',') || '(empty)'}; files matched: ${codeFiles.join(',')}`);
     await saveImpactOutputs(workspaceRoot, { mmd, seeds, results, edges, codeSnippets });
 
     lastImpactCache = {
@@ -309,10 +412,14 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
         seeds,
         results,
         edges,
+        codeSnippets,
         direction,
         depth,
         includeDynamic,
         root: workspaceRoot,
+        gitRange: gitRange || null,
+        source: gitRange ? 'git' : 'files',
+        targets,
         settings: {
             includeMmd: true,
             includeCode: true,
@@ -330,12 +437,187 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
     }
 }
 
-async function handleAI(payload) {
-    // 仅占位：将 payload 写入输出，便于后续对接实际 AI 接口
+function parseDifyOutputs(outputs) {
+    if (!outputs) return null;
     try {
-        output.appendLine(`AI payload summary: prdLen=${payload?.prd?.length || 0}, mmd=${payload?.includeMmd}, code=${payload?.includeCode}, bgFiles=${bgFilesCache.length}, codeSnippets=${lastImpactCache?.settings?.codeSnippetsCount || 0}`);
+        if (typeof outputs === 'string') return JSON.parse(outputs);
+        return {
+            requirementComparison: outputs.requirement_comparison || outputs.requirementComparison || null,
+            impactAnalysis: outputs.impact_analysis || outputs.impactAnalysis || null,
+            risks: outputs.risks || [],
+            testSuggestions: outputs.test_suggestions || outputs.testSuggestions || [],
+            summary: outputs.summary || '',
+        };
+    } catch (err) {
+        output.appendLine(`parseDifyOutputs failed: ${err?.message || err}`);
+        return null;
+    }
+}
+
+async function handleAI() {
+    try {
+        // const prd = payload?.prd || '';
+        const root = lastImpactCache?.root || await ensureWorkspaceFolder();
+        const gitRange = lastImpactCache?.gitRange;
+        const apiKey = process.env.DIFY_API_KEY || undefined;
+        const baseUrl = process.env.DIFY_BASE_URL || undefined;
+        if (!apiKey) {
+            vscode.window.showWarningMessage('未配置 DIFY_API_KEY，使用内置默认密钥调用。');
+            output.appendLine('DIFY_API_KEY 未配置，将使用内置默认密钥。');
+        }
+
+        const impactPath = path.join(root, 'impact.txt');
+        const codePath = path.join(root, 'impactCode.txt');
+        const graphPath = findGraphPath(root);
+        const gitContext = gitRange ? collectGitContext(root, gitRange) : null;
+        const impactCache = lastImpactCache;
+
+        const client = new DifyClient({ baseUrl, apiKey });
+
+        const readTextIfExists = async (p) => {
+            try {
+                return await fsp.readFile(p, 'utf8');
+            } catch {
+                return '';
+            }
+        };
+
+        const readJsonIfExists = async (p) => {
+            try {
+                const txt = await fsp.readFile(p, 'utf8');
+                return JSON.parse(txt);
+            } catch {
+                return null;
+            }
+        };
+
+        const inputsObj = {};
+        let attached = 0;
+
+        const codeImpactContent = await readTextIfExists(impactPath);
+        if (codeImpactContent) {
+            inputsObj.codeImpactMmd = codeImpactContent;
+        }
+
+        const codeJson = await readJsonIfExists(codePath);
+        if (codeJson) {
+            inputsObj.code = codeJson;
+            attached++;
+        }
+
+        const graphJson = graphPath ? await readJsonIfExists(graphPath) : null;
+        if (graphJson) {
+            inputsObj.AST = graphJson;
+            attached++;
+        }
+
+        // const prdArr = [];
+        // for (const f of bgFilesCache) {
+        //     const id = await uploadIfExists(f.path, path.basename(f.path), inferMimeByExt(f.path));
+        //     if (id) {
+        //         prdArr.push(toFileInput(id, path.basename(f.path)));
+        //         attached++;
+        //     }
+        // }
+        // if (prd && prd.trim()) {
+        //     const id = await client.uploadFile({ content: Buffer.from(prd, 'utf8'), fileName: 'prd.txt', mime: 'text/plain' });
+        //     if (id) {
+        //         prdArr.push(toFileInput(id, 'prd.txt'));
+        //         attached++;
+        //     }
+        // }
+        // if (prdArr.length) inputsObj.prd = prdArr;
+
+        if (gitRange) {
+            inputsObj.git_range = gitRange;
+        }
+
+        if (!inputsObj.codeImpactMmd || attached === 0) {
+            vscode.window.showWarningMessage('缺少必需的上下文（codeImpactMmd 或 code/AST），请先运行影响分析。');
+            return;
+        }
+
+        output.appendLine(`AI 调用开始:, gitRange=${gitRange || '(none)'}, keys=${Object.keys(inputsObj).join(',')}`);
+
+        // 通知侧边栏禁用按钮
+        sidebarWebview?.postMessage({ type: 'aiRunning', running: true });
+
+        const stream = await client.runWorkflow({ inputs: inputsObj, user: 'code-impact-vscode', stream: true });
+        const reader = stream.getReader ? stream.getReader() : stream;
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finalText = '';
+        const nodeStatus = new Map(); // id -> {label,state}
+
+        const pushStatus = (id, label, state) => {
+            nodeStatus.set(id, { label, state });
+            sidebarWebview?.postMessage({ type: 'status', items: Array.from(nodeStatus.values()) });
+        };
+
+        const flush = () => {
+            const parts = buffer.split('\n');
+            buffer = parts.pop();
+            for (const line of parts) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:')) continue;
+                const data = trimmed.replace(/^data:\s*/, '');
+                if (data === '[DONE]') {
+                    sidebarWebview?.postMessage({ type: 'final', text: finalText });
+                    sidebarWebview?.postMessage({ type: 'status', items: Array.from(nodeStatus.values()) });
+                    return 'done';
+                }
+                // 尝试解析节点事件
+                try {
+                    const obj = JSON.parse(data);
+                    if (obj?.event === 'node_started' && obj?.node_id) {
+                        pushStatus(obj.node_id, obj.node_name || obj.node_id, 'running');
+                        continue;
+                    }
+                    if (obj?.event === 'node_finished' && obj?.node_id) {
+                        pushStatus(obj.node_id, obj.node_name || obj.node_id, 'done');
+                        if (obj.outputs) {
+                            const txt = obj.outputs.text ?? obj.outputs;
+                            finalText = typeof txt === 'string' ? txt : JSON.stringify(txt, null, 2);
+                        }
+                        continue;
+                    }
+                    if (obj?.event === 'workflow_finished') {
+                        const txt = obj?.data?.outputs?.text ?? obj?.outputs?.text ?? obj?.outputs;
+                        if (txt !== undefined) {
+                            finalText = typeof txt === 'string' ? txt : JSON.stringify(txt, null, 2);
+                        }
+                        continue;
+                    }
+                } catch {
+                    // 非 JSON，视为正文
+                }
+                // 普通文本：保留最后一段作为最终输出
+                finalText = data;
+            }
+            return null;
+        };
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const status = flush();
+                if (status === 'done') break;
+            }
+            flush();
+            sidebarWebview?.postMessage({ type: 'aiFinal', text: '' });
+            const mdDoc = await vscode.workspace.openTextDocument({ content: finalText || '', language: 'markdown' });
+            await vscode.window.showTextDocument(mdDoc, { preview: true });
+            showInfo('Dify 分析完成（流式）');
+        } catch (err) {
+            sidebarWebview?.postMessage({ type: 'error', text: err?.message || String(err) });
+            throw err;
+        }
     } catch (err) {
         output.appendLine(`handleAI error: ${err?.stack || err}`);
+        vscode.window.showErrorMessage(`AI 分析失败: ${err?.message || err}`);
+        sidebarWebview?.postMessage({ type: 'aiRunning', running: false });
     }
 }
 
@@ -361,12 +643,12 @@ class CodeImpactSidebarProvider {
         this.context = context;
         this.currentRoot = null;
     }
-
-    resolveWebviewView(webviewView) {
+        resolveWebviewView(webviewView) {
         try {
             webviewView.webview.options = {
                 enableScripts: true,
             };
+            sidebarWebview = webviewView.webview;
             webviewView.webview.html = this.getHtml(webviewView.webview);
             output.appendLine('Sidebar webview rendered');
             webviewView.webview.onDidReceiveMessage(async (msg) => {
@@ -392,10 +674,10 @@ class CodeImpactSidebarProvider {
                         }
                         case 'impactGitDiff': {
                             const root = this.currentRoot || await ensureWorkspaceFolder();
-                            const { range, depth, direction } = msg.payload || {};
+                            const { range, direction } = msg.payload || {};
                             await runImpact({
                                 gitRange: range || 'origin/main...HEAD',
-                                depth: depth ? Number(depth) : 4,
+                                depth: Infinity,
                                 includeDynamic: true,
                                 direction: direction || 'reverse',
                                 root,
@@ -403,76 +685,40 @@ class CodeImpactSidebarProvider {
                                 settings: {
                                     includeMmd: true,
                                     includeCode: true,
-                                    codeMaxFiles: 5,
-                                    codeMaxLines: 200,
+                                    codeMaxFiles: Infinity,
+                                    codeMaxLines: Infinity,
                                 }
                             });
                             break;
                         }
-                        case 'impactFiles': {
-                            const root = this.currentRoot || await ensureWorkspaceFolder();
-                            const selection = await vscode.window.showOpenDialog({
-                                canSelectMany: true,
-                                canSelectFiles: true,
-                                canSelectFolders: false,
-                                openLabel: '选择作为种子文件',
-                            });
-                            const files = selection?.map((u) => u.fsPath) || [];
-                            if (!files.length) {
-                                vscode.window.showWarningMessage('未选择文件。');
-                                break;
-                            }
-                            const { depth, direction } = msg.payload || {};
-                            await runImpact({
-                                files,
-                                depth: depth ? Number(depth) : 4,
-                                includeDynamic: true,
-                                direction: direction || 'reverse',
-                                root,
-                                mermaid: true,
-                                settings: {
-                                    includeMmd: true,
-                                    includeCode: true,
-                                    codeMaxFiles: 5,
-                                    codeMaxLines: 200,
-                                }
-                            });
-                            break;
-                        }
-                        case 'pickBgFiles': {
-                            const picked = await vscode.window.showOpenDialog({
-                                canSelectMany: true,
-                                canSelectFiles: true,
-                                canSelectFolders: false,
-                                openLabel: '选择背景文件（小于 512KB）',
-                            });
-                            if (picked && picked.length) {
-                                await readBgFiles(picked.map((u) => u.fsPath));
-                                webviewView.webview.postMessage({
-                                    type: 'bgFilesUpdated',
-                                    files: bgFilesCache.map(f => ({ path: f.path, size: f.size, truncated: f.truncated })),
-                                });
-                            }
-                            break;
-                        }
-                        case 'clearBgFiles': {
-                            bgFilesCache = [];
-                            webviewView.webview.postMessage({ type: 'bgFilesUpdated', files: [] });
-                            break;
-                        }
+                        // case 'pickBgFiles': {
+                        //     const picked = await vscode.window.showOpenDialog({
+                        //         canSelectMany: true,
+                        //         canSelectFiles: true,
+                        //         canSelectFolders: false,
+                        //         openLabel: '选择背景文件（小于 512KB）',
+                        //     });
+                        //     if (picked && picked.length) {
+                        //         await readBgFiles(picked.map((u) => u.fsPath));
+                        //         webviewView.webview.postMessage({
+                        //             type: 'bgFilesUpdated',
+                        //             files: bgFilesCache.map(f => ({ path: f.path, size: f.size, truncated: f.truncated })),
+                        //         });
+                        //     }
+                        //     break;
+                        // }
+                        // case 'clearBgFiles': {
+                        //     bgFilesCache = [];
+                        //     webviewView.webview.postMessage({ type: 'bgFilesUpdated', files: [] });
+                        //     break;
+                        // }
                         case 'ai': {
-                            const { prd } = msg.payload || {};
-                            const payload = {
-                                prd,
-                                allowCode: true,
-                                includeMmd: true,
-                                includeCode: true,
-                                codeMaxFiles: 5,
-                                codeMaxLines: 200,
-                                impact: lastImpactCache,
-                                bgFiles: bgFilesCache,
-                            };
-                            await handleAI(payload);
+                            // const { prd } = msg.payload || {};
+                            // const payload = {
+                            //     prd,
+                                
+                            // };
+                            await handleAI();
                             break;
                         }
                         default:
@@ -502,10 +748,9 @@ class CodeImpactSidebarProvider {
   <style>
     body { font-family: sans-serif; padding: 8px; }
     h3 { margin: 0 0 8px; }
-    button { width: 100%; margin: 4px 0; padding: 6px 8px; }
+    button { width: 100%; margin: 4px 0; padding: 6px 8px;border-radius: 4px;background-color: white;color: black;border: 1px solid #ccc; }
     small { color: #888; }
-    input, textarea, select, label { width: 100%; margin: 4px 0; }
-    textarea { resize: vertical; }
+    input, select { width: 100%; margin: 4px 0;border-radius: 4px;background-color: white;color: black;border: 1px solid #ccc; }
   </style>
 </head>
 <body>
@@ -520,65 +765,28 @@ class CodeImpactSidebarProvider {
     <div><b>Git Diff 影响分析</b></div>
     <input id="gitRange" type="text" value="origin/main...HEAD" />
     <div style="display:flex;gap:8px;align-items:center;">
-      <label>深度 <input id="depthGit" type="number" value="4" style="width:60px;" /></label>
       <select id="dirGit">
         <option value="reverse" selected>反向箭头</option>
         <option value="forward">正向箭头</option>
       </select>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <label>最多文件 <input id="codeMaxFiles" type="number" value="5" style="width:50px;" /></label>
-      <label>每文件行数 <input id="codeMaxLines" type="number" value="200" style="width:60px;" /></label>
-    </div>
     <button id="git">运行 Git Diff 分析</button>
   </div>
 
   <div style="margin-top:8px;">
-    <div><b>文件种子影响分析</b></div>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <label>深度 <input id="depthFiles" type="number" value="4" style="width:60px;" /></label>
-      <select id="dirFiles">
-        <option value="reverse" selected>反向箭头</option>
-        <option value="forward">正向箭头</option>
-      </select>
-    </div>
-    <button id="files">选择文件并分析</button>
+    <div><b>AI (Dify)</b></div>
+    <button id="ai">AI 分析</button>
   </div>
-
-  <div style="margin-top:8px;">
-    <div><b>背景文件</b></div>
-    <button id="pickBg">选择背景文件</button>
-    <button id="clearBg">清空背景文件</button>
-    <div id="bgList" style="font-size:12px;color:#aaa;margin-top:4px;">无</div>
-  </div>
-
-  <div style="margin-top:8px;">
-    <div><b>AI 占位</b></div>
-    <textarea id="prd" rows="3" placeholder="粘贴 PRD/需求"></textarea>
-    <button id="ai">AI 分析（占位，不发送）</button>
-  </div>
-
-  <small>结果以 mermaid 打开，反向箭头表示从变更到受影响入口。</small>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const rootLabel = document.getElementById('rootLabel');
-    const bgList = document.getElementById('bgList');
-    const state = { bgFiles: [] };
+    const aiBtn = document.getElementById('ai');
     const commonPayload = () => ({
-      codeMaxFiles: Number(document.getElementById('codeMaxFiles').value || 5),
-      codeMaxLines: Number(document.getElementById('codeMaxLines').value || 200),
       includeMmd: true,
       includeCode: true,
       includeDynamic: true,
     });
 
-    const renderBg = () => {
-      if (!state.bgFiles.length) { bgList.textContent = '无'; return; }
-      bgList.innerHTML = state.bgFiles.map(f => {
-        const sizeKb = Math.round(f.size / 1024);
-        return f.path + ' (' + sizeKb + 'KB' + (f.truncated ? ',截断' : '') + ')';
-      }).join('<br/>');
-    };
 
     document.getElementById('pickRoot').onclick = () => vscode.postMessage({ type: 'selectRoot' });
     document.getElementById('build').onclick = () => vscode.postMessage({ type: 'buildGraph' });
@@ -587,30 +795,17 @@ class CodeImpactSidebarProvider {
         type: 'impactGitDiff',
         payload: {
           range: document.getElementById('gitRange').value,
-          depth: document.getElementById('depthGit').value,
           direction: document.getElementById('dirGit').value,
           ...commonPayload(),
         }
       });
     };
-    document.getElementById('files').onclick = () => {
-      vscode.postMessage({
-        type: 'impactFiles',
-        payload: {
-          depth: document.getElementById('depthFiles').value,
-          direction: document.getElementById('dirFiles').value,
-          ...commonPayload(),
-        }
-      });
-    };
-    document.getElementById('pickBg').onclick = () => vscode.postMessage({ type: 'pickBgFiles' });
-    document.getElementById('clearBg').onclick = () => vscode.postMessage({ type: 'clearBgFiles' });
     document.getElementById('ai').onclick = () => {
+      aiBtn.disabled = true;
+      aiBtn.textContent = '分析中...';
       vscode.postMessage({
         type: 'ai',
         payload: {
-          prd: document.getElementById('prd').value,
-          allowCode: true,
           ...commonPayload(),
         }
       });
@@ -620,9 +815,17 @@ class CodeImpactSidebarProvider {
       if (msg.type === 'rootSelected') {
         rootLabel.textContent = msg.root;
       }
-      if (msg.type === 'bgFilesUpdated') {
-        state.bgFiles = msg.files || [];
-        renderBg();
+      if (msg.type === 'aiRunning') {
+        aiBtn.disabled = !!msg.running;
+        aiBtn.textContent = msg.running ? '分析中...' : 'AI 分析';
+      }
+      if (msg.type === 'aiFinal') {
+        aiBtn.disabled = false;
+        aiBtn.textContent = 'AI 分析';
+      }
+      if (msg.type === 'error') {
+        aiBtn.disabled = false;
+        aiBtn.textContent = 'AI 分析';
       }
     });
     renderBg();

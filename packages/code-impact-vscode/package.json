@@ -36,6 +36,7 @@
         }
     },
     "dependencies": {
-        "code-impact": "file:../code-impact"
+        "code-impact": "file:../code-impact",
+        "undici": "^6.18.2"
     }
 }

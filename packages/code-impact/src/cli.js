@@ -91,7 +91,7 @@ program
             const out = await saveGraph(graph, projectRoot);
             console.log(chalk.green(`依赖图已生成: ${out}`));
             if (graph.errors?.length) {
-                console.log(chalk.yellow(`解析出现 ${graph.errors.length} 个警告，详情见 graph.json errors 字段`));
+                console.log(chalk.yellow(`解析出现 ${graph.errors.length} 个警告，详情见 graph.txt errors 字段`));
             }
         } catch (err) {
             console.error(chalk.red(`构建失败: ${err.message}`));
