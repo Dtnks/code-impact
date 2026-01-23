@@ -17,8 +17,9 @@ function inferMimeByExt(filePath) {
 const output = vscode.window.createOutputChannel('Code Impact');
 let lastImpactCache = null; // { mmd, seeds, results, edges, direction, depth, includeDynamic, settings }
 let bgFilesCache = []; // { path, size, content, truncated }
-let aiStreamPanel = null;
 let sidebarWebview = null;
+let conversationId = null;
+let conversationHistory = []; // [{role:'user'|'assistant', text}]
 
 async function loadCore() {
     try {
@@ -368,14 +369,15 @@ function getNonce() {
     return text;
 }
 
-async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, mermaid = true, root, direction = 'reverse', settings = {} }) {
+async function runImpact({ gitRange, depth = 4, includeDynamic = true, mermaid = true, root, direction = 'reverse', settings = {} }) {
     const { loadGraph, traverseImpact, getChangedFiles, getChangedRanges } = await loadCore();
     const workspaceRoot = root || await ensureWorkspaceFolder();
     let targets = [];
-    if (files && files.length) {
-        targets = files.map((f) => path.isAbsolute(f) ? f : path.join(workspaceRoot, f));
-    } else if (gitRange) {
+    if (gitRange) {
         targets = getChangedFiles({ projectRoot: workspaceRoot, range: gitRange });
+    }else{
+        vscode.window.showWarningMessage('未输入比较范围');
+        return 
     }
     targets = filterTargets(targets);
     if (targets.length === 0) {
@@ -385,13 +387,12 @@ async function runImpact({ files, gitRange, depth = 4, includeDynamic = true, me
 
     const graph = await loadGraph(workspaceRoot);
     let rangesMap = {};
-    if (gitRange) {
-        try {
-            rangesMap = getChangedRanges({ projectRoot: workspaceRoot, range: gitRange, files: targets });
-        } catch {
-            rangesMap = {};
-        }
+    try {
+        rangesMap = getChangedRanges({ projectRoot: workspaceRoot, range: gitRange, files: targets });
+    } catch {
+        rangesMap = {};
     }
+    
     const { results, edges, seeds } = traverseImpact(graph, targets, {
         includeDynamic,
         depth: Number.isFinite(depth) ? depth : Infinity,
@@ -454,13 +455,14 @@ function parseDifyOutputs(outputs) {
     }
 }
 
-async function handleAI() {
+async function handleAI(payload = {}) {
     try {
         // const prd = payload?.prd || '';
         const root = lastImpactCache?.root || await ensureWorkspaceFolder();
         const gitRange = lastImpactCache?.gitRange;
         const apiKey = process.env.DIFY_API_KEY || undefined;
         const baseUrl = process.env.DIFY_BASE_URL || undefined;
+        const query = (payload?.query || '').trim() || '请根据提供的上下文进行影响分析并给出结果。';
         if (!apiKey) {
             vscode.window.showWarningMessage('未配置 DIFY_API_KEY，使用内置默认密钥调用。');
             output.appendLine('DIFY_API_KEY 未配置，将使用内置默认密钥。');
@@ -491,25 +493,37 @@ async function handleAI() {
             }
         };
 
+        const toStr = (v) => {
+            if (v === undefined || v === null) return undefined;
+            if (typeof v === 'string') return v;
+            try {
+                return JSON.stringify(v);
+            } catch {
+                return String(v);
+            }
+        };
+
         const inputsObj = {};
         let attached = 0;
 
         const codeImpactContent = await readTextIfExists(impactPath);
         if (codeImpactContent) {
-            inputsObj.codeImpactMmd = codeImpactContent;
+            inputsObj.codeImpactMmd = toStr(codeImpactContent);
         }
 
         const codeJson = await readJsonIfExists(codePath);
         if (codeJson) {
-            inputsObj.code = codeJson;
+            inputsObj.code = toStr(codeJson);
             attached++;
         }
 
         const graphJson = graphPath ? await readJsonIfExists(graphPath) : null;
         if (graphJson) {
-            inputsObj.AST = graphJson;
+            inputsObj.AST = toStr(graphJson);
             attached++;
         }
+
+        // 不再上传 codeSnippets / gitContext，首调仅传核心上下文
 
         // const prdArr = [];
         // for (const f of bgFilesCache) {
@@ -528,31 +542,39 @@ async function handleAI() {
         // }
         // if (prdArr.length) inputsObj.prd = prdArr;
 
-        if (gitRange) {
-            inputsObj.git_range = gitRange;
-        }
+        // 不再上传 git_range
+
+        // 用户输入作为 question 传给 Agent
+        inputsObj.question = toStr(query);
 
         if (!inputsObj.codeImpactMmd || attached === 0) {
             vscode.window.showWarningMessage('缺少必需的上下文（codeImpactMmd 或 code/AST），请先运行影响分析。');
             return;
         }
 
-        output.appendLine(`AI 调用开始:, gitRange=${gitRange || '(none)'}, keys=${Object.keys(inputsObj).join(',')}`);
+        const lens = Object.entries(inputsObj).map(([k, v]) => {
+            const str = typeof v === 'string' ? v : '';
+            return `${k}:${str.length}`;
+        }).join(', ');
+        output.appendLine(`AI 调用开始: gitRange=${gitRange || '(none)'}, keys=${Object.keys(inputsObj).join(',')}, lens=(${lens})`);
 
         // 通知侧边栏禁用按钮
         sidebarWebview?.postMessage({ type: 'aiRunning', running: true });
 
-        const stream = await client.runWorkflow({ inputs: inputsObj, user: 'code-impact-vscode', stream: true });
+        const stream = await client.runAgent({
+            inputs: inputsObj,
+            user: 'code-impact-vscode',
+            query,
+            stream: true,
+            conversationId,
+        });
         const reader = stream.getReader ? stream.getReader() : stream;
         const decoder = new TextDecoder();
         let buffer = '';
         let finalText = '';
-        const nodeStatus = new Map(); // id -> {label,state}
-
-        const pushStatus = (id, label, state) => {
-            nodeStatus.set(id, { label, state });
-            sidebarWebview?.postMessage({ type: 'status', items: Array.from(nodeStatus.values()) });
-        };
+        const thoughtLogs = [];
+        sidebarWebview?.postMessage({ type: 'aiThought', text: '模型思考中...' });
+        output.appendLine('AI 流式开始...');
 
         const flush = () => {
             const parts = buffer.split('\n');
@@ -563,36 +585,42 @@ async function handleAI() {
                 const data = trimmed.replace(/^data:\s*/, '');
                 if (data === '[DONE]') {
                     sidebarWebview?.postMessage({ type: 'final', text: finalText });
-                    sidebarWebview?.postMessage({ type: 'status', items: Array.from(nodeStatus.values()) });
                     return 'done';
                 }
-                // 尝试解析节点事件
                 try {
                     const obj = JSON.parse(data);
-                    if (obj?.event === 'node_started' && obj?.node_id) {
-                        pushStatus(obj.node_id, obj.node_name || obj.node_id, 'running');
+                    if (obj?.conversation_id) {
+                        conversationId = obj.conversation_id;
+                    }
+                    // Agent 思考
+                    if (obj?.event === 'agent_thought' && obj?.content) {
+                        sidebarWebview?.postMessage({ type: 'aiThought', text: obj.content });
+                        thoughtLogs.push(obj.content);
                         continue;
                     }
-                    if (obj?.event === 'node_finished' && obj?.node_id) {
-                        pushStatus(obj.node_id, obj.node_name || obj.node_id, 'done');
-                        if (obj.outputs) {
-                            const txt = obj.outputs.text ?? obj.outputs;
-                            finalText = typeof txt === 'string' ? txt : JSON.stringify(txt, null, 2);
-                        }
+                    // 普通消息片段
+                    if (obj?.event === 'message' && obj?.answer !== undefined) {
+                        finalText += obj.answer || '';
+                        sidebarWebview?.postMessage({ type: 'aiThought', text: finalText });
                         continue;
                     }
-                    if (obj?.event === 'workflow_finished') {
-                        const txt = obj?.data?.outputs?.text ?? obj?.outputs?.text ?? obj?.outputs;
-                        if (txt !== undefined) {
-                            finalText = typeof txt === 'string' ? txt : JSON.stringify(txt, null, 2);
-                        }
+                    // 最终消息
+                    if (obj?.event === 'message_end' && obj?.answer !== undefined) {
+                        finalText = obj.answer || finalText;
+                        sidebarWebview?.postMessage({ type: 'aiThought', text: finalText });
+                        continue;
+                    }
+                    if (obj?.event === 'error') {
+                        const msg = obj?.message || 'Agent 调用错误';
+                        sidebarWebview?.postMessage({ type: 'error', text: msg });
+                        output.appendLine(`Agent error: ${msg}`);
                         continue;
                     }
                 } catch {
                     // 非 JSON，视为正文
+                    finalText += data;
+                    sidebarWebview?.postMessage({ type: 'aiThought', text: finalText });
                 }
-                // 普通文本：保留最后一段作为最终输出
-                finalText = data;
             }
             return null;
         };
@@ -606,9 +634,12 @@ async function handleAI() {
                 if (status === 'done') break;
             }
             flush();
-            sidebarWebview?.postMessage({ type: 'aiFinal', text: '' });
-            const mdDoc = await vscode.workspace.openTextDocument({ content: finalText || '', language: 'markdown' });
-            await vscode.window.showTextDocument(mdDoc, { preview: true });
+            conversationHistory.push({ role: 'user', text: query });
+            conversationHistory.push({ role: 'assistant', text: finalText || '(空)' });
+            sidebarWebview?.postMessage({ type: 'chatHistory', conversationId, history: conversationHistory });
+            sidebarWebview?.postMessage({ type: 'aiFinal', text: finalText || '' });
+            sidebarWebview?.postMessage({ type: 'aiRunning', running: false });
+            output.appendLine('AI 流式结束');
             showInfo('Dify 分析完成（流式）');
         } catch (err) {
             sidebarWebview?.postMessage({ type: 'error', text: err?.message || String(err) });
@@ -650,6 +681,7 @@ class CodeImpactSidebarProvider {
             };
             sidebarWebview = webviewView.webview;
             webviewView.webview.html = this.getHtml(webviewView.webview);
+            webviewView.webview.postMessage({ type: 'chatHistory', conversationId, history: conversationHistory });
             output.appendLine('Sidebar webview rendered');
             webviewView.webview.onDidReceiveMessage(async (msg) => {
                 try {
@@ -713,12 +745,13 @@ class CodeImpactSidebarProvider {
                         //     break;
                         // }
                         case 'ai': {
-                            // const { prd } = msg.payload || {};
-                            // const payload = {
-                            //     prd,
-                                
-                            // };
-                            await handleAI();
+                            await handleAI(msg.payload || {});
+                            break;
+                        }
+                        case 'resetConversation': {
+                            conversationId = null;
+                            conversationHistory = [];
+                            sidebarWebview?.postMessage({ type: 'chatHistory', conversationId, history: conversationHistory });
                             break;
                         }
                         default:
@@ -774,19 +807,49 @@ class CodeImpactSidebarProvider {
   </div>
 
   <div style="margin-top:8px;">
-    <div><b>AI (Dify)</b></div>
-    <button id="ai">AI 分析</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <b>Agent 对话</b>
+      <small id="convId" style="color:#888;">未建立会话</small>
+    </div>
+    <div id="chatHistory" style="margin-top:6px;padding:6px;border:1px solid #ddd;border-radius:4px;min-height:120px;max-height:220px;overflow-y:auto;font-size:12px;white-space:pre-wrap;color:white;background:transparent"></div>
+    <textarea id="chatInput" rows="3" placeholder="输入问题..." style="width:100%;margin-top:6px;border-radius:4px;background:transparent;color:white;border:1px solid #ccc;"></textarea>
+    <div style="display:flex;gap:8px;margin-top:6px;">
+      <button id="ai">发送</button>
+      <button id="resetChat">重置会话</button>
+    </div>
+    <div id="aiThinking" style="margin-top:6px;padding:6px;border:1px dashed #ccc;border-radius:4px;min-height:40px;font-size:12px;white-space:pre-wrap;color:white;background:transparent">等待中…</div>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const rootLabel = document.getElementById('rootLabel');
     const aiBtn = document.getElementById('ai');
+    const aiThinking = document.getElementById('aiThinking');
+    const chatHistoryEl = document.getElementById('chatHistory');
+    const chatInput = document.getElementById('chatInput');
+    const resetChat = document.getElementById('resetChat');
+    const convIdEl = document.getElementById('convId');
     const commonPayload = () => ({
       includeMmd: true,
       includeCode: true,
       includeDynamic: true,
     });
-
+    const state = { conversationId: null, history: [] };
+    const escape = (str = '') => String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    const renderHistory = () => {
+      convIdEl.textContent = state.conversationId || '未建立会话';
+      if (!state.history.length) {
+        chatHistoryEl.innerHTML = '<div style="color:#888;">暂无历史</div>';
+        return;
+      }
+      chatHistoryEl.innerHTML = state.history.map((m) => {
+        const role = m.role === 'assistant' ? 'Agent' : '我';
+        return \`<div style="margin-bottom:6px;"><b>\${role}：</b>\${escape(m.text || '')}</div>\`;
+      }).join('');
+      chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+    };
 
     document.getElementById('pickRoot').onclick = () => vscode.postMessage({ type: 'selectRoot' });
     document.getElementById('build').onclick = () => vscode.postMessage({ type: 'buildGraph' });
@@ -801,14 +864,22 @@ class CodeImpactSidebarProvider {
       });
     };
     document.getElementById('ai').onclick = () => {
+      const q = chatInput.value.trim();
+      if (!q) {
+        aiThinking.textContent = '请输入问题后再发送';
+        return;
+      }
       aiBtn.disabled = true;
-      aiBtn.textContent = '分析中...';
-      vscode.postMessage({
-        type: 'ai',
-        payload: {
-          ...commonPayload(),
-        }
-      });
+      aiBtn.textContent = '发送中...';
+      aiThinking.textContent = '模型思考中...';
+      vscode.postMessage({ type: 'ai', payload: { ...commonPayload(), query: q } });
+    };
+    resetChat.onclick = () => {
+      state.history = [];
+      state.conversationId = null;
+      renderHistory();
+      aiThinking.textContent = '会话已重置';
+      vscode.postMessage({ type: 'resetConversation' });
     };
     window.addEventListener('message', event => {
       const msg = event.data;
@@ -817,18 +888,30 @@ class CodeImpactSidebarProvider {
       }
       if (msg.type === 'aiRunning') {
         aiBtn.disabled = !!msg.running;
-        aiBtn.textContent = msg.running ? '分析中...' : 'AI 分析';
+        aiBtn.textContent = msg.running ? '发送中...' : '发送';
+        if (msg.running) aiThinking.textContent = '模型思考中...';
       }
       if (msg.type === 'aiFinal') {
         aiBtn.disabled = false;
-        aiBtn.textContent = 'AI 分析';
+        aiBtn.textContent = '发送';
+        aiThinking.textContent = '思考已结束';
+        chatInput.value = '';
       }
       if (msg.type === 'error') {
         aiBtn.disabled = false;
-        aiBtn.textContent = 'AI 分析';
+        aiBtn.textContent = '发送';
+        aiThinking.textContent = '发生错误';
+      }
+      if (msg.type === 'aiThought') {
+        aiThinking.textContent = msg.text || '';
+      }
+      if (msg.type === 'chatHistory') {
+        state.history = msg.history || [];
+        state.conversationId = msg.conversationId || null;
+        renderHistory();
       }
     });
-    renderBg();
+    renderHistory();
   </script>
 </body>
 </html>`;

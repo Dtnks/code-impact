@@ -54,8 +54,6 @@ function ensureDir(p) {
 
 function tryResolveWithExt(basePath, extensions) {
     if (fileExists(basePath)) return basePath;
-    const ext = path.extname(basePath);
-    if (ext && fileExists(basePath)) return basePath;
     for (const ex of extensions) {
         const cand = basePath + ex;
         if (fileExists(cand)) return cand;
@@ -84,7 +82,7 @@ function resolveWithAlias(spec, fromFile, { projectRoot, alias, extensions }) {
         const keys = Object.keys(alias).sort((a, b) => b.length - a.length);
         for (const key of keys) {
             if (spec === key || spec.startsWith(`${key}/`)) {
-                const rest = spec.slice(key.length);
+                const rest = spec.slice(key.length).replace(/^\/+/, '');
                 const base = path.resolve(projectRoot, alias[key], rest);
                 const resolved = tryResolveWithExt(base, extensions);
                 if (resolved) {
@@ -236,7 +234,10 @@ export async function buildGraph({
     }
 
     const webpackResolve = await loadWebpackResolve({ projectRoot, webpackConfig });
-    const alias = webpackResolve.alias || {};
+    const alias = {
+        '@': 'src', // Vite/Vue 常见默认别名
+        ...(webpackResolve.alias || {}),
+    };
     const extensions = webpackResolve.extensions?.length ? webpackResolve.extensions : exts;
 
     const files = new Set();

@@ -4,7 +4,8 @@ const { fetch, FormData, File } = require('undici');
 
 // 个人使用：直接内置默认的云端地址与 API Key，可被外部覆盖
 const DEFAULT_BASE_URL = 'https://api.dify.ai/v1';
-const DEFAULT_API_KEY = 'app-zlaSszpl8pmTKjDJQFqa37RT';
+// 新的 Agent 应用密钥
+const DEFAULT_API_KEY = 'app-R0xzSSGP2LRWiBl6Ne2AI5D2';
 
 /**
  * Dify API 客户端
@@ -25,44 +26,41 @@ class DifyClient {
     }
 
     /**
-     * 运行 Workflow（推荐 JSON，文件请先 upload 获取 upload_file_id）
+     * 运行 Agent 应用（替代原 Workflow）
      * @param {Object} options
-     * @param {Object} options.inputs - 输入变量；文件列表变量请传 [{type,transfer_method:'local_file',upload_file_id,name}]
-     * @param {Array} [options.files] - 顶层 files 可选
-     * @param {string} options.user - 用户标识
-     * @param {boolean} options.stream - 是否流式返回
-     * @param {FormData} [options.formData] - 如需自带 multipart，可传入（需包含 inputs）
-     * @param {string} [options.traceId] - trace_id 可选
+     * @param {Object} options.inputs - 传入的上下文（建议均为字符串）
+     * @param {string} [options.query] - 用户 query，默认空字符串
+     * @param {string} [options.user] - 用户标识
+     * @param {boolean} [options.stream] - 是否流式
+     * @param {string} [options.conversationId] - 会话 ID，用于保留上下文
      */
-    async runWorkflow(options = {}) {
+    async runAgent(options = {}) {
         const {
             inputs = {},
-            files,
+            query = '',
             user = 'code-impact-vscode',
             stream = true,
-            formData,
-            traceId,
+            conversationId,
         } = options;
-        const url = `${this.baseUrl}/workflows/run`;
+        const url = `${this.baseUrl}/chat-messages`;
         const headers = { Authorization: `Bearer ${this.apiKey}` };
 
         const payload = {
             inputs,
+            query,
             response_mode: stream ? 'streaming' : 'blocking',
             user,
         };
-        if (traceId) payload.trace_id = traceId;
-        if (Array.isArray(files) && files.length) payload.files = files;
-        let body = JSON.stringify(payload);
+        if (conversationId) payload.conversation_id = conversationId;
 
         const response = await fetch(url, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
-            body,
+            body: JSON.stringify(payload),
         });
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Dify Workflow 调用失败: ${response.status} ${response.statusText}\n${errorText}`);
+            throw new Error(`Dify Agent 调用失败: ${response.status} ${response.statusText}\n${errorText}`);
         }
         if (stream) return response.body;
         return await response.json();
